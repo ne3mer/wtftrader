@@ -37,7 +37,7 @@ def recalc_level(arr, p, original, direction):
         return r.copy() if r is not None else (original.copy() if original else None)
 
 def main():
-    symbol = "EURUSD=X"
+    symbol = "GC=F"
     period = "730d"
     interval = "1h"
     
@@ -333,9 +333,89 @@ def main():
     df['ATR_50d_Mean'] = df['ATRr_14'].rolling(window=1200).mean()
     df['Market_Volatility_Regime'] = df['ATRr_14'] / df['ATR_50d_Mean']
 
-    # ML Target
-    df['Next_Close'] = df['Close'].shift(-1)
-    df['Target'] = (df['Next_Close'] > df['Close']).astype(int)
+    # ML Target: Forward Simulation for Sweep Setups
+    df['Target'] = np.nan
+    df['Setup_Type'] = np.nan
+    df['Is_Toxic_Window'] = df.index.hour.isin([12, 13]).astype(int)
+    
+    last_event = 0
+    
+    for idx, row in df.iterrows():
+        if row['SMC_Event'] != 0:
+            if not row['SMC_In_Penalty_Box']:
+                # LONG SETUP
+                if row['SMC_Event'] == -2 and last_event == 1:
+                    df.loc[idx, 'Setup_Type'] = 1
+                    extreme_level = row['SMC_Must_Crash']
+                    structural_tp = row['SMC_Must_Break']
+                    start_pos = df.index.get_loc(idx)
+                    
+                    swept = False
+                    sweep_low = float('inf')
+                    filled = False
+                    pend_sl = 0.0
+                    pend_tp = structural_tp
+                    
+                    for i in range(start_pos + 1, min(len(df), start_pos + 200)):
+                        fw_row = df.iloc[i]
+                        if fw_row['SMC_Event'] != 0: break
+                        
+                        if not swept:
+                            if fw_row['Low'] < extreme_level:
+                                swept = True
+                                sweep_low = min(sweep_low, fw_row['Low'])
+                        else:
+                            if not filled:
+                                sweep_low = min(sweep_low, fw_row['Low'])
+                                if fw_row['Close'] > extreme_level:
+                                    filled = True
+                                    atr_entry = fw_row['ATRr_14']
+                                    pend_sl = sweep_low - (1.0 * atr_entry)
+                            else:
+                                if fw_row['Low'] <= pend_sl:
+                                    df.loc[idx, 'Target'] = 0
+                                    break
+                                elif fw_row['High'] >= pend_tp:
+                                    df.loc[idx, 'Target'] = 1
+                                    break
+                
+                # SHORT SETUP
+                elif row['SMC_Event'] == 2 and last_event == -1:
+                    df.loc[idx, 'Setup_Type'] = -1
+                    extreme_level = row['SMC_Must_Break']
+                    structural_tp = row['SMC_Must_Crash']
+                    start_pos = df.index.get_loc(idx)
+                    
+                    swept = False
+                    sweep_high = float('-inf')
+                    filled = False
+                    pend_sl = 0.0
+                    pend_tp = structural_tp
+                    
+                    for i in range(start_pos + 1, min(len(df), start_pos + 200)):
+                        fw_row = df.iloc[i]
+                        if fw_row['SMC_Event'] != 0: break
+                        
+                        if not swept:
+                            if fw_row['High'] > extreme_level:
+                                swept = True
+                                sweep_high = max(sweep_high, fw_row['High'])
+                        else:
+                            if not filled:
+                                sweep_high = max(sweep_high, fw_row['High'])
+                                if fw_row['Close'] < extreme_level:
+                                    filled = True
+                                    atr_entry = fw_row['ATRr_14']
+                                    pend_sl = sweep_high + (1.0 * atr_entry)
+                            else:
+                                if fw_row['High'] >= pend_sl:
+                                    df.loc[idx, 'Target'] = 0
+                                    break
+                                elif fw_row['Low'] <= pend_tp:
+                                    df.loc[idx, 'Target'] = 1
+                                    break
+                                    
+            last_event = row['SMC_Event']
 
     # Drop early records with no structural boundaries
     df = df.dropna(subset=['SMC_Must_Break', 'SMC_Must_Crash', 'ATR_50d_Mean'])

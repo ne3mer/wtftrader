@@ -6,7 +6,7 @@ from sklearn.metrics import accuracy_score
 def main():
     print("Loading SMC dataset...")
     df = pd.read_csv('processed_smc_data.csv', index_col='Datetime', parse_dates=True)
-    df = df.dropna()
+    df = df.dropna(subset=['Target']) # Train ONLY on valid labeled setups!
 
     if df.empty:
         print("Failed to load or clean data.")
@@ -16,7 +16,7 @@ def main():
         'EMA_50', 'EMA_200', 'RSI_14', 'ATRr_14', 'MACDh_12_26_9', 'Distance_to_EMA50',
         'SMC_State', 'Dist_to_Must_Break', 'Dist_to_Must_Crash', 'SMC_In_Penalty_Box',
         'CHoCH_Extension_Distance', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos', 
-        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime'
+        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime', 'Is_Toxic_Window'
     ]
     X = df[features]
     y = df['Target']
@@ -53,32 +53,16 @@ def main():
     prob_0 = probs[:, 0]
     prob_1 = probs[:, 1]
 
-    strong_signals = []
-    for p0, p1 in zip(prob_0, prob_1):
-        if p1 > 0.60:
-            strong_signals.append(1)
-        elif p0 > 0.60:
-            strong_signals.append(-1)
-        else:
-            strong_signals.append(0)
-            
-    test_results = pd.DataFrame({'Target': y_test, 'Prob_0': prob_0, 'Prob_1': prob_1, 'Strong_Signal': strong_signals})
-
-    total_samples = len(test_results)
-    high_conf_trades = test_results[test_results['Strong_Signal'] != 0].copy()
-    num_high_conf = len(high_conf_trades)
+    test_results = pd.DataFrame({'Target': y_test, 'Prob_1': prob_1})
     
-    selectivity_pct = (num_high_conf / total_samples) * 100
-    print(f"\nTotal test samples: {total_samples}")
-    print(f"Number of high-confidence signals (prob > 60%): {num_high_conf}")
-    print(f"Percentage of signals meeting threshold: {selectivity_pct:.2f}%")
-
-    if num_high_conf > 0:
-        high_conf_trades['Prediction'] = high_conf_trades['Strong_Signal'].map({1: 1, -1: 0})
-        acc = accuracy_score(high_conf_trades['Target'], high_conf_trades['Prediction'])
-        print(f"Accuracy of ONLY high-confidence signals: {acc:.4f}")
-    else:
-        print("No signals met the 60% confidence threshold.")
+    # We predict taking the trade if ML probability of Win (Prob_1) > 0.50
+    test_results['Prediction'] = (test_results['Prob_1'] > 0.50).astype(int)
+    
+    acc = accuracy_score(test_results['Target'], test_results['Prediction'])
+    total_samples = len(test_results)
+    
+    print(f"\nTotal test setups: {total_samples}")
+    print(f"Accuracy of setup predictions: {acc:.4f}")
 
 if __name__ == "__main__":
     main()

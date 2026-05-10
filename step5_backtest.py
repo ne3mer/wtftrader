@@ -19,15 +19,17 @@ def main():
     df = pd.read_csv('processed_smc_data.csv', index_col='Datetime')
     df.index = pd.to_datetime(df.index, utc=True)
     
-    df_clean = df.dropna().copy()
+    # Train exclusively on valid setups
+    df_signals = df.dropna(subset=['Target']).copy()
+    
     features = [
         'EMA_50', 'EMA_200', 'RSI_14', 'ATRr_14', 'MACDh_12_26_9', 'Distance_to_EMA50',
         'SMC_State', 'Dist_to_Must_Break', 'Dist_to_Must_Crash', 'SMC_In_Penalty_Box',
         'CHoCH_Extension_Distance', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos', 
-        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime'
+        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime', 'Is_Toxic_Window'
     ]
-    X = df_clean[features]
-    y = df_clean['Target']
+    X = df_signals[features]
+    y = df_signals['Target']
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=False)
     
@@ -37,13 +39,16 @@ def main():
     model = RandomForestClassifier(random_state=42, **best_params)
     model.fit(X_train, y_train)
 
-    probs = model.predict_proba(X_test)
+    print("Running Backtest with ML > 50% Limit Orders...")
+    
+    # We must run backtest on the full timeline (including non-signals) that corresponds to the test period
+    split_idx = X_test.index[0]
+    df_test_full = df.loc[split_idx:].copy()
+    
+    # Predict probabilities for the entire test set
+    probs = model.predict_proba(df_test_full[features])
+    df_test_full['Prob_1'] = probs[:, 1] # Probability of Setup WIN
 
-    df_test = df.loc[X_test.index].copy()
-    df_test['Prob_0'] = probs[:, 0]
-    df_test['Prob_1'] = probs[:, 1]
-
-    print("Running Backtest with Dynamic Threshold and Limit Orders...")
     balance = 10000.0
     risk_pct = 0.01
     
@@ -53,60 +58,45 @@ def main():
     tp_price = 0.0
     units = 0.0
     
-    pending_order = 0
-    pend_entry = 0.0
-    pend_sl = 0.0
-    pend_tp = 0.0
+    pending_setup = 0
+    extreme_level = 0.0
+    structural_tp = 0.0
+    swept = False
+    sweep_extreme = 0.0
+    last_event = 0
     
     equity_curve = []
     total_trades = 0
     winning_trades = 0
     gross_profit = 0.0
     gross_loss = 0.0
-    
     last_event = 0
-    buffer = 0.0005 # 5 pips
     
-    # Dynamic Threshold tracking
-    recent_outcomes = []
-    base_threshold = 0.60
-    
-    for idx, row in df_test.iterrows():
+    for idx, row in df_test_full.iterrows():
         # Update last event
         if row['SMC_Event'] != 0:
-            # Cancel pending orders on new structural events
-            pending_order = 0
-            
-            # Dynamic Threshold Calculation
-            dynamic_threshold = base_threshold
-            if len(recent_outcomes) >= 10:
-                recent_win_rate = recent_outcomes.count('Win') / len(recent_outcomes)
-                if recent_win_rate < 0.40:
-                    dynamic_threshold = min(0.95, base_threshold + 0.10)
+            # Cancel pending setups on new structural events
+            pending_setup = 0
             
             # Evaluate new setups
             if not row['SMC_In_Penalty_Box']:
-                # LONG SETUP: CHoCH Down (-2) following BOS Up (1)
-                if row['SMC_Event'] == -2 and last_event == 1 and row['Prob_1'] > dynamic_threshold:
-                        origin_low_candle = find_origin_candle(df, idx, row['SMC_Must_Crash'], col='Low')
-                        origin_high_candle = find_origin_candle(df, idx, row['SMC_Must_Break'], col='High')
-                        if origin_low_candle is not None and origin_high_candle is not None:
-                            pend_entry = origin_low_candle['High']
-                            pend_tp = origin_high_candle['Low']
-                            pend_sl = row['SMC_Must_Crash'] - buffer
-                            if pend_tp > pend_entry > pend_sl:
-                                pending_order = 1
+                req_prob = 0.75 if row['Is_Toxic_Window'] == 1 else 0.50
+                
+                # LONG SETUP
+                if row['SMC_Event'] == -2 and last_event == 1 and row['Prob_1'] > req_prob:
+                    pending_setup = 1
+                    extreme_level = row['SMC_Must_Crash']
+                    structural_tp = row['SMC_Must_Break']
+                    swept = False
+                    sweep_extreme = float('inf')
                                 
-                # SHORT SETUP: CHoCH Up (2) following BOS Down (-1)
-                elif row['SMC_Event'] == 2 and last_event == -1 and row['Prob_0'] > dynamic_threshold:
-                        origin_high_candle = find_origin_candle(df, idx, row['SMC_Must_Break'], col='High')
-                        origin_low_candle = find_origin_candle(df, idx, row['SMC_Must_Crash'], col='Low')
-                        if origin_high_candle is not None and origin_low_candle is not None:
-                            pend_entry = origin_high_candle['Low']
-                            pend_tp = origin_low_candle['High']
-                            pend_sl = row['SMC_Must_Break'] + buffer
-                            if pend_tp < pend_entry < pend_sl:
-                                pending_order = -1
+                # SHORT SETUP
+                elif row['SMC_Event'] == 2 and last_event == -1 and row['Prob_1'] > req_prob:
+                    pending_setup = -1
+                    extreme_level = row['SMC_Must_Break']
+                    structural_tp = row['SMC_Must_Crash']
+                    swept = False
+                    sweep_extreme = float('-inf')
             
             last_event = row['SMC_Event']
             
@@ -137,37 +127,52 @@ def main():
             if pnl > 0:
                 winning_trades += 1
                 gross_profit += pnl
-                recent_outcomes.append('Win')
             else:
                 gross_loss += abs(pnl)
-                recent_outcomes.append('Loss')
                 
-            if len(recent_outcomes) > 10:
-                recent_outcomes.pop(0)
-                
-        # Process pending limit orders
-        if position == 0 and pending_order != 0:
-            filled = False
-            if pending_order == 1 and row['Low'] <= pend_entry:
-                filled = True
-                position = 1
-            elif pending_order == -1 and row['High'] >= pend_entry:
-                filled = True
-                position = -1
-                
-            if filled:
-                entry_price = pend_entry
-                sl_price = pend_sl
-                tp_price = pend_tp
-                
-                risk_amount = balance * risk_pct
-                sl_dist = abs(entry_price - sl_price)
-                units = risk_amount / sl_dist if sl_dist > 0 else 0
-                pending_order = 0
+        # Process pending setups
+        if position == 0 and pending_setup != 0:
+            if pending_setup == 1:
+                if not swept:
+                    if row['Low'] < extreme_level:
+                        swept = True
+                        sweep_extreme = min(sweep_extreme, row['Low'])
+                else:
+                    sweep_extreme = min(sweep_extreme, row['Low'])
+                    if row['Close'] > extreme_level:
+                        # Filled!
+                        position = 1
+                        entry_price = row['Close']
+                        sl_price = sweep_extreme - (1.0 * row['ATRr_14'])
+                        tp_price = structural_tp
+                        
+                        risk_amount = balance * risk_pct
+                        sl_dist = abs(entry_price - sl_price)
+                        units = risk_amount / sl_dist if sl_dist > 0 else 0
+                        pending_setup = 0
+                        
+            elif pending_setup == -1:
+                if not swept:
+                    if row['High'] > extreme_level:
+                        swept = True
+                        sweep_extreme = max(sweep_extreme, row['High'])
+                else:
+                    sweep_extreme = max(sweep_extreme, row['High'])
+                    if row['Close'] < extreme_level:
+                        # Filled!
+                        position = -1
+                        entry_price = row['Close']
+                        sl_price = sweep_extreme + (1.0 * row['ATRr_14'])
+                        tp_price = structural_tp
+                        
+                        risk_amount = balance * risk_pct
+                        sl_dist = abs(entry_price - sl_price)
+                        units = risk_amount / sl_dist if sl_dist > 0 else 0
+                        pending_setup = 0
                 
         equity_curve.append(balance)
 
-    df_test['Equity'] = equity_curve
+    df_test_full['Equity'] = equity_curve
 
     # Metrics Calculations
     net_profit = balance - 10000.0
@@ -188,8 +193,8 @@ def main():
 
     print("Saving Equity Curve plot...")
     plt.figure(figsize=(12, 6))
-    plt.plot(df_test.index, df_test['Equity'], label="Account Equity", color="gold", linewidth=1.5)
-    plt.title("Step 8: Final SMC Optimized Equity Curve\n(Amu Khani Limit Logic + ML Filter + No Mondays)", fontsize=14, pad=15)
+    plt.plot(df_test_full.index, df_test_full['Equity'], label="Account Equity", color="gold", linewidth=1.5)
+    plt.title("Step 8: Final SMC Optimized Equity Curve\n(Amu Khani Sweep Logic + Setup Outcome ML)", fontsize=14, pad=15)
     plt.xlabel("Date", fontsize=11)
     plt.ylabel("Account Balance (USD)", fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.7)
