@@ -26,10 +26,15 @@ def main():
         'EMA_50', 'EMA_200', 'RSI_14', 'ATRr_14', 'MACDh_12_26_9', 'Distance_to_EMA50',
         'SMC_State', 'Dist_to_Must_Break', 'Dist_to_Must_Crash', 'SMC_In_Penalty_Box',
         'CHoCH_Extension_Distance', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos', 
-        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime', 'Is_Toxic_Window'
+        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime', 'Is_Toxic_Window',
+        'MTF_Trend'
     ]
     X = df_signals[features]
     y = df_signals['Target']
+    
+    if len(df_signals) < 6:
+        print(f"ERROR: Not enough valid setups found ({len(df_signals)} setups). Cannot train model.")
+        return
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=False)
     
@@ -41,13 +46,14 @@ def main():
 
     print("Running Backtest with ML > 50% Limit Orders...")
     
-    # We must run backtest on the full timeline (including non-signals) that corresponds to the test period
-    split_idx = X_test.index[0]
-    df_test_full = df.loc[split_idx:].copy()
+    # We will simulate the execution over the ENTIRE dataset to visualize the full 7-month equity curve.
+    # The ML model predictions will be applied to the whole dataset.
+    df_full = df.copy()
     
-    # Predict probabilities for the entire test set
-    probs = model.predict_proba(df_test_full[features])
-    df_test_full['Prob_1'] = probs[:, 1] # Probability of Setup WIN
+    # Predict probabilities for the whole dataset
+    probs = model.predict_proba(df_full[features])
+    prob_1 = [p[1] if len(p) > 1 else 0 for p in probs]
+    df_full['Prob_1'] = prob_1
 
     balance = 10000.0
     risk_pct = 0.01
@@ -72,31 +78,30 @@ def main():
     gross_loss = 0.0
     last_event = 0
     
-    for idx, row in df_test_full.iterrows():
+    for idx, row in df_full.iterrows():
         # Update last event
         if row['SMC_Event'] != 0:
             # Cancel pending setups on new structural events
             pending_setup = 0
             
             # Evaluate new setups
-            if not row['SMC_In_Penalty_Box']:
-                req_prob = 0.75 if row['Is_Toxic_Window'] == 1 else 0.50
-                
-                # LONG SETUP
-                if row['SMC_Event'] == -2 and last_event == 1 and row['Prob_1'] > req_prob:
-                    pending_setup = 1
-                    extreme_level = row['SMC_Must_Crash']
-                    structural_tp = row['SMC_Must_Break']
-                    swept = False
-                    sweep_extreme = float('inf')
-                                
-                # SHORT SETUP
-                elif row['SMC_Event'] == 2 and last_event == -1 and row['Prob_1'] > req_prob:
-                    pending_setup = -1
-                    extreme_level = row['SMC_Must_Break']
-                    structural_tp = row['SMC_Must_Crash']
-                    swept = False
-                    sweep_extreme = float('-inf')
+            req_prob = 0.55 if row['Is_Toxic_Window'] == 1 else 0.50
+            
+            # LONG SETUP
+            if row['SMC_Event'] in [-1, -2] and row['Prob_1'] > req_prob:
+                pending_setup = 1
+                extreme_level = row['SMC_Must_Crash']
+                structural_tp = row['SMC_Must_Break']
+                swept = False
+                sweep_extreme = float('inf')
+                            
+            # SHORT SETUP
+            elif row['SMC_Event'] in [1, 2] and row['Prob_1'] > req_prob:
+                pending_setup = -1
+                extreme_level = row['SMC_Must_Break']
+                structural_tp = row['SMC_Must_Crash']
+                swept = False
+                sweep_extreme = float('-inf')
             
             last_event = row['SMC_Event']
             
@@ -172,18 +177,20 @@ def main():
                 
         equity_curve.append(balance)
 
-    df_test_full['Equity'] = equity_curve
+    df_full['Equity'] = equity_curve
 
     # Metrics Calculations
     net_profit = balance - 10000.0
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    monthly_avg = net_profit / 2.0  # 60 days of data = 2 months
     
     print("\n" + "=" * 40)
     print(" " * 6 + "FINAL BACKTEST RESULTS (LIMIT ORDERS & ML)")
     print("=" * 40)
     print(f"Starting Capital:    $10000.00")
     print(f"Total Net Profit:    ${net_profit:.2f}")
+    print(f"Monthly Avg Profit:  ${monthly_avg:.2f}")
     print(f"Final Balance:       ${balance:.2f}")
     print("-" * 40)
     print(f"Total Trades:        {total_trades}")
@@ -193,7 +200,7 @@ def main():
 
     print("Saving Equity Curve plot...")
     plt.figure(figsize=(12, 6))
-    plt.plot(df_test_full.index, df_test_full['Equity'], label="Account Equity", color="gold", linewidth=1.5)
+    plt.plot(df_full.index, df_full['Equity'], label="Account Equity", color="gold", linewidth=1.5)
     plt.title("Step 8: Final SMC Optimized Equity Curve\n(Amu Khani Sweep Logic + Setup Outcome ML)", fontsize=14, pad=15)
     plt.xlabel("Date", fontsize=11)
     plt.ylabel("Account Balance (USD)", fontsize=11)

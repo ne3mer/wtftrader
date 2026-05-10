@@ -16,12 +16,19 @@ def main():
         'EMA_50', 'EMA_200', 'RSI_14', 'ATRr_14', 'MACDh_12_26_9', 'Distance_to_EMA50',
         'SMC_State', 'Dist_to_Must_Break', 'Dist_to_Must_Crash', 'SMC_In_Penalty_Box',
         'CHoCH_Extension_Distance', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos', 
-        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime', 'Is_Toxic_Window'
+        'Minute_Sin', 'Minute_Cos', 'Market_Volatility_Regime', 'Is_Toxic_Window',
+        'MTF_Trend'
     ]
     X = df[features]
     y = df['Target']
 
     print("Splitting data into training and testing sets...")
+    
+    if len(X) < 6:
+        print(f"ERROR: Not enough valid setups found ({len(X)} setups). TimeSeriesSplit requires at least 6.")
+        print("The combination of 15m choppy data + Amu Khani Penalty Box + MTF Filter is too restrictive.")
+        return
+        
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=False)
 
     tscv = TimeSeriesSplit(n_splits=5)
