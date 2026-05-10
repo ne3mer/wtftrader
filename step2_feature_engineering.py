@@ -1,9 +1,9 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import pandas_ta as ta
 
 def main():
-    # 1. Fetch the data
     symbol = "EURUSD=X"
     period = "730d"
     interval = "1h"
@@ -19,35 +19,54 @@ def main():
     cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
     df = df[cols_to_keep].copy()
     
-    # 2. Add technical indicators using pandas_ta
     print("Calculating technical indicators...")
-    # EMA_50 and EMA_200
     df.ta.ema(length=50, append=True)
     df.ta.ema(length=200, append=True)
-    
-    # RSI (length=14)
     df.ta.rsi(length=14, append=True)
-    
-    # ATR (length=14)
     df.ta.atr(length=14, append=True)
-    
-    # MACD (fast=12, slow=26, signal=9)
     df.ta.macd(fast=12, slow=26, signal=9, append=True)
 
-    # 3. Create custom feature
-    # pandas_ta automatically names the EMA column 'EMA_50'
     df['Distance_to_EMA50'] = df['Close'] - df['EMA_50']
 
-    # 4. Drop any rows with NaN values
+    # --- SMC Features ---
+    print("Calculating SMC features...")
+    # 1. Swing High/Low (20 periods)
+    df['Last_Swing_High'] = df['High'].rolling(window=20).max().shift(1)
+    df['Last_Swing_Low'] = df['Low'].rolling(window=20).min().shift(1)
+
+    # 2. Market Structure (BOS)
+    df['BOS'] = 0
+    df.loc[df['Close'] > df['Last_Swing_High'], 'BOS'] = 1
+    df.loc[df['Close'] < df['Last_Swing_Low'], 'BOS'] = -1
+
+    # 3. Fair Value Gaps (FVG)
+    bullish_fvg = df['Low'] > df['High'].shift(2)
+    bearish_fvg = df['High'] < df['Low'].shift(2)
+    df['FVG_Present'] = 0
+    df.loc[bullish_fvg, 'FVG_Present'] = 1
+    df.loc[bearish_fvg, 'FVG_Present'] = -1
+
+    # 4. Liquidity Grabs (Sweep)
+    bullish_sweep = (df['Low'] < df['Last_Swing_Low']) & (df['Close'] > df['Last_Swing_Low'])
+    bearish_sweep = (df['High'] > df['Last_Swing_High']) & (df['Close'] < df['Last_Swing_High'])
+    df['Liquidity_Sweep'] = 0
+    df.loc[bullish_sweep, 'Liquidity_Sweep'] = 1
+    df.loc[bearish_sweep, 'Liquidity_Sweep'] = -1
+
+    # 5. Body to Wick Ratio
+    body_size = (df['Close'] - df['Open']).abs()
+    total_size = df['High'] - df['Low']
+    df['Body_to_Wick_Ratio'] = body_size / total_size.replace(0, np.nan)
+    df['Body_to_Wick_Ratio'] = df['Body_to_Wick_Ratio'].fillna(0)
+
+    # Drop NaNs
     df.dropna(inplace=True)
 
-    # 5. Print the names of all columns
     print("\nColumns after feature engineering:")
     print(df.columns.tolist())
 
-    # 6. Print the last 5 rows of the DataFrame
     print("\nLast 5 rows:")
-    print(df.tail(5))
+    print(df[['Close', 'BOS', 'FVG_Present', 'Liquidity_Sweep', 'Body_to_Wick_Ratio']].tail(5))
 
 if __name__ == "__main__":
     main()

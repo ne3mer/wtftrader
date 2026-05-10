@@ -1,0 +1,11 @@
+========================================\n      AMU KHANI SMC LOSS ANALYSIS       \n========================================\n\nTotal Trades: 93\nTotal Losses: 88\n\n--- 1. Toxic Trading Hours & Days ---\nLosses by Day of Week (0=Mon, 4=Fri):\nDayOfWeek
+0    22
+2    19
+3    18
+1    16
+4    13\n\nLosses by Hour of Day:\nHour
+13    14
+12    11
+15     7
+17     6
+9      6\n\n--- 2. Structural Distance Analysis ---\nAverage Distance to Must_Break on Wins vs Losses:\nWins:   0.00262\nLosses: 0.00331\n\nAverage Distance to Must_Crash on Wins vs Losses:\nWins:   0.00207\nLosses: 0.00321\n\n--- Conclusion & Recommended Filters ---\n- Avoid trading on Mondays, especially around Hour 13.\n

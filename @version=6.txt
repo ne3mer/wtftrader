@@ -1,0 +1,349 @@
+//@version=6
+strategy("Amu Khani Strategy - Edited",
+     overlay=true,
+     max_lines_count=500,
+     margin_long=0,
+     margin_short=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=false)
+
+// =========================================================================
+// 1. SETTINGS & INPUTS
+// =========================================================================
+grp_setup = "Strategy Setup"
+sl_buffer_ticks = input.int(5, title="SL Buffer (Ticks/Points)", tooltip="10 Ticks = 1 Pip. Use 5 for 0.5 pips.", group=grp_setup)
+sl_buffer_val   = sl_buffer_ticks * syminfo.mintick
+
+min_rr          = input.float(1.5, title="Minimum Risk/Reward Ratio", step=0.1, group=grp_setup)
+use_seq_filter  = input.bool(true, title="Use Sequence Filter (BOS before CHoCH)", tooltip="If unchecked, trades all CHoCHs", group=grp_setup)
+
+grp_safety = "Safety Filters"
+use_max_qty      = input.bool(true, title="Enable Max Position Size Limit", group=grp_safety)
+max_qty_limit    = input.float(100000.0, title="Max Position Size (Units)", group=grp_safety, tooltip="Absolute maximum lot size allowed per trade.")
+
+grp_inv = "Order Invalidation (Cancel Missed Trades)"
+use_invalidation = input.bool(true, title="Cancel Order if Target is Front-run", group=grp_inv)
+invalidation_pct = input.float(80.0, title="Invalidation Threshold (% of TP)", minval=10, maxval=100, step=5, group=grp_inv)
+
+grp_money = "Money Management"
+// CHANGED: Risk is now in Dollars
+risk_usd        = input.float(100.0, title="Risk Per Trade ($)", minval=1.0, group=grp_money, tooltip="Amount of money to lose if SL is hit.")
+use_partial     = input.bool(true, title="Use Partial Take Profit", group=grp_money)
+partial_mult    = input.float(2.0, title="Partial Close at X × Risk", step=0.1, minval=1.0, group=grp_money)
+partial_qty_pct = input.int(50, title="Partial Close Quantity (%)", minval=1, maxval=99, group=grp_money)
+
+grp_filters = "Additional Filters"
+max_lookback = input.int(100, title="Max CHoCH Lookback (Bars)", minval=1, group=grp_filters, tooltip="If the CHoCH happens more than this many bars after the high/low was formed, the trade is ignored.")
+
+// =========================================================================
+// 2. CUSTOM TYPES
+// =========================================================================
+type extrime
+    chart.point e
+    chart.point g
+    chart.point r
+    chart.point b
+    int index_cross = bar_index
+    bool processed  = false
+
+// =========================================================================
+// 3. HIGH DETECTION LOGIC
+// =========================================================================
+var extrime h         = extrime.new()
+var confirmedhigh     = array.new<extrime>()
+var wait_for_green_h  = true, var wait_for_red_h     = false, var wait_for_break_h  = false
+var break_level_h     = close, var pick_h             = close, var green_close       = close
+var new_h             = false
+
+if close > open and (high > pick_h)
+    new_h             := false, wait_for_green_h := true, h := extrime.new()
+if close > open and wait_for_green_h
+    pick_h            := high, green_close      := close, wait_for_green_h := false, wait_for_red_h    := true, break_level_h     := low
+    h.e               := chart.point.from_index(bar_index, pick_h)
+else if wait_for_red_h and close < open
+    wait_for_red_h    := false, last_pick          = pick_h, pick_h            := math.max(high, pick_h), break_level_h     := math.min(low, break_level_h), wait_for_break_h := true
+    if pick_h > last_pick
+        if close[1] > open[1] and close < open
+            break_level_h := math.min(low, low[1])
+        h.e := chart.point.from_index(bar_index, pick_h)
+else if wait_for_break_h
+    if close < break_level_h
+        wait_for_green_h := true, wait_for_red_h    := false, wait_for_break_h := false, h.b               := chart.point.from_index(bar_index, close), new_h             := true
+    else
+        last_pick = pick_h, pick_h   := math.max(high, pick_h)
+        if pick_h > last_pick
+            if close[1] > open[1] and close < open
+                break_level_h := math.min(low, low[1])
+            h.e := chart.point.from_index(bar_index, pick_h)
+
+// =========================================================================
+// 4. LOW DETECTION LOGIC
+// =========================================================================
+var extrime l         = extrime.new()
+var confirmedlow      = array.new<extrime>()
+var wait_for_red_l    = true, var wait_for_green_l  = false, var wait_for_break_l  = false
+var break_level_l     = close, var low_l             = close, var red_close         = close
+var new_l             = false
+
+if close < open and (low < low_l)
+    new_l         := false, wait_for_red_l := true, l := extrime.new()
+if close < open and wait_for_red_l
+    low_l          := low, red_close      := close, wait_for_red_l  := false, wait_for_green_l := true, break_level_l  := high
+    l.e            := chart.point.from_index(bar_index, low_l)
+else if wait_for_green_l and close > open
+    wait_for_green_l := false, last_low           = low_l, low_l             := math.min(low, low_l), break_level_l     := math.max(high, break_level_l), wait_for_break_l := true
+    if low_l < last_low
+        if close[1] < open[1] and close > open
+            break_level_l := math.max(high, high[1])
+        l.e := chart.point.from_index(bar_index, low_l)
+else if wait_for_break_l
+    if close > break_level_l
+        wait_for_red_l   := true, wait_for_green_l := false, wait_for_break_l := false, l.b               := chart.point.from_index(bar_index, close), new_l             := true
+    else
+        last_low = low_l, low_l   := math.min(low, low_l)
+        if low_l < last_low
+            if close[1] < open[1] and close > open
+                break_level_l := math.max(high, high[1])
+            l.e := chart.point.from_index(bar_index, low_l)
+
+// =========================================================================
+// 5. CONFIRMING EXTREMES
+// =========================================================================
+extrime coming_high = na
+extrime coming_low  = na
+
+if new_h
+    line.new(h.e, chart.point.from_index(h.e.index + 3, h.e.price), color=color.green, extend=extend.none)
+    coming_high := h.copy(), array.unshift(confirmedhigh, h.copy()), new_h := false
+if new_l
+    line.new(l.e, chart.point.from_index(l.e.index + 3, l.e.price), color=color.red, extend=extend.none)
+    coming_low := l.copy(), array.unshift(confirmedlow, l.copy()), new_l := false
+
+// =========================================================================
+// 6. MARKET STRUCTURE (BOS & CHOCH)
+// =========================================================================
+var extrime must_break = na, var extrime must_crash = na
+var int     state      = 0, int         event      = 0
+
+if not na(coming_high)
+    if na(must_break)
+        must_break := coming_high.copy()
+    else if coming_high.e.price > must_break.e.price and math.max(close[bar_index - coming_high.e.index], open [bar_index - coming_high.e.index]) > must_break.e.price
+        must_break := coming_high.copy()
+    else if not na(must_crash)
+        if coming_high.e.price < must_crash.e.price and coming_high.e.price > confirmedlow.get(0).e.price
+            must_break := coming_high.copy()
+
+if not na(coming_low)
+    if na(must_crash)
+        must_crash := coming_low.copy()
+    else if coming_low.e.price < must_crash.e.price and math.min(close[bar_index - coming_low.e.index], open [bar_index - coming_low.e.index]) < must_crash.e.price
+        must_crash := coming_low.copy()
+    else if not na(must_break)
+        if coming_low.e.price > must_break.e.price and coming_low.e.price < confirmedhigh.get(0).e.price
+            must_crash := coming_low.copy()
+
+recalc_level(arr, p, original, dir) =>
+    if dir == -1
+        mn = 10000000000.0, r  = extrime.new()
+        for [index, value] in arr
+            if value.e.price < mn and value.e.index > p.e.index
+                mn := value.e.price, r  := value
+        na(r.e) ? original : r.copy()
+    else
+        mx = 0.0000000001, r  = extrime.new()
+        for [index, value] in arr
+            if value.e.price > mx and value.e.index > p.e.index
+                mx := value.e.price, r  := value
+        na(r.e) ? original : r.copy()
+
+var extrime last_bos_h = na
+if not na(must_break)
+    if not na(coming_low) and not na(last_bos_h)
+        must_crash_tmp = recalc_level(confirmedlow, last_bos_h, must_crash, -1)
+        if must_crash.e.index > last_bos_h.e.index and must_crash_tmp.e.index < last_bos_h.index_cross
+            must_crash := must_crash_tmp
+    if close > must_break.e.price and must_break.processed != true
+        must_break.processed := true, event := state >= 0 ? 1 : 2, state := 1
+        if event == 1
+            last_bos_h             := must_break.copy()
+            last_bos_h.index_cross := bar_index
+            must_crash             := recalc_level(confirmedlow, must_break, must_crash, -1)
+
+var extrime last_bos = na
+if not na(must_crash)
+    if not na(coming_high) and not na(last_bos)
+        must_break_tmp = recalc_level(confirmedhigh, last_bos, must_break, 1)
+        if must_break.e.index < last_bos.e.index and must_break_tmp.e.index < last_bos.index_cross
+            must_break := must_break_tmp
+    if close < must_crash.e.price and must_crash.processed != true
+        must_crash.processed := true, event := state <= 0 ? -1 : -2, state := -1
+        if event == -1
+            last_bos             := must_crash.copy()
+            last_bos.index_cross := bar_index
+            must_break           := recalc_level(confirmedhigh, must_crash, must_break, 1)
+        if event == -2
+            must_break := recalc_level(confirmedhigh, must_crash, must_break, 1)
+
+// =========================================================================
+// 7. EVENT FILTER (Directions, Penalty Box, & Lookback Filter)
+// =========================================================================
+var int last_event = 0
+var int prev_event = 0 
+var bool chop_blocker = false 
+var bool penalty_box  = false 
+
+bool long_allowed  = false
+bool short_allowed = false
+
+if event != 0
+    // --- 1. BOS LOGIC ---
+    if event == 1 or event == -1
+        chop_blocker := false 
+
+    // --- 2. CHoCH LOGIC ---
+    if event == -2 or event == 2
+        // Calculate Distance between current bar and the origin of the structure
+        int origin_index = (event == 2) ? must_break.e.index : must_crash.e.index
+        int bars_since_origin = bar_index - origin_index
+        bool lookback_ok = bars_since_origin <= max_lookback
+
+        if chop_blocker
+            penalty_box := true 
+        else
+            if penalty_box
+                penalty_box := false 
+            else
+                // --- DIRECTIONAL & LOOKBACK CHECK ---
+                if use_seq_filter
+                    // SHORT: Event 2 (CHoCH Up) + Last was -1 (BOS Down) + Distance Check
+                    if event == 2 and last_event == -1 and lookback_ok
+                        short_allowed := true
+                    
+                    // LONG: Event -2 (CHoCH Down) + Last was 1 (BOS Up) + Distance Check
+                    else if event == -2 and last_event == 1 and lookback_ok
+                        long_allowed := true
+                else
+                    // If sequence filter is OFF, still respect the lookback filter
+                    if lookback_ok
+                        if event == 2
+                            short_allowed := true
+                        else if event == -2
+                            long_allowed := true
+        
+        chop_blocker := true
+
+    // Update memory
+    prev_event := last_event
+    last_event := event
+// =========================================================================
+// 8. STRATEGY ENTRY LOGIC
+// =========================================================================
+var bool  waiting_for_newl  = false, var float tp_level_long     = na, var int   choch_bear_bar    = na
+var bool  waiting_for_newh  = false, var float tp_level_short    = na, var int   choch_bull_bar    = na
+var float pend_L_entry = na, var float pend_L_tp = na
+var float pend_S_entry = na, var float pend_S_tp = na
+var float saved_L_risk = na
+var float saved_S_risk = na
+
+if long_allowed
+    tp_level_long    := low[bar_index - must_break.e.index], waiting_for_newl := true, choch_bear_bar   := bar_index
+    pend_L_entry := na, pend_L_tp := na
+
+if short_allowed
+    tp_level_short   := high[bar_index - must_crash.e.index], waiting_for_newh := true, choch_bull_bar   := bar_index
+    pend_S_entry := na, pend_S_tp := na
+
+// ── LONG ENTRY ──
+if waiting_for_newl and not na(coming_low) and bar_index > choch_bear_bar
+    bool is_new_low = na(coming_low[1]) ? true : coming_low.e.index != (coming_low[1]).e.index
+    if is_new_low
+        float entry_price = high[bar_index - coming_low.e.index]
+        float sl_price    = coming_low.e.price - sl_buffer_val
+
+        if not na(tp_level_long) and tp_level_long > entry_price
+            float risk_per_unit   = entry_price - sl_price
+            float reward_per_unit = tp_level_long - entry_price
+            
+            // Risk Calculation based on Dollar Amount
+            if risk_per_unit > 0 and reward_per_unit >= risk_per_unit * min_rr
+                float pos_qty = math.max(1, math.floor(risk_usd / risk_per_unit))
+                
+                if use_max_qty
+                    pos_qty := math.min(pos_qty, max_qty_limit)
+
+                strategy.entry("Long", strategy.long, qty=pos_qty, limit=entry_price, comment="Buy Limit")
+                strategy.exit("Long Exit", from_entry="Long", stop=sl_price, limit=tp_level_long)
+                
+                pend_L_entry := entry_price, pend_L_tp := tp_level_long
+                saved_L_risk := risk_per_unit
+
+        waiting_for_newl := false, tp_level_long := na
+
+// ── SHORT ENTRY ──
+if waiting_for_newh and not na(coming_high) and bar_index > choch_bull_bar
+    bool is_new_high = na(coming_high[1]) ? true : coming_high.e.index != (coming_high[1]).e.index
+    if is_new_high
+        float entry_price = low[bar_index - coming_high.e.index]
+        float sl_price    = coming_high.e.price + sl_buffer_val
+
+        if not na(tp_level_short) and tp_level_short < entry_price
+            float risk_per_unit   = sl_price - entry_price
+            float reward_per_unit = entry_price - tp_level_short
+            
+            // Risk Calculation based on Dollar Amount
+            if risk_per_unit > 0 and reward_per_unit >= risk_per_unit * min_rr
+                float pos_qty = math.max(1, math.floor(risk_usd / risk_per_unit))
+                
+                if use_max_qty
+                    pos_qty := math.min(pos_qty, max_qty_limit)
+
+                strategy.entry("Short", strategy.short, qty=pos_qty, limit=entry_price, comment="Sell Limit")
+                strategy.exit("Short Exit", from_entry="Short", stop=sl_price, limit=tp_level_short)
+                
+                pend_S_entry := entry_price, pend_S_tp := tp_level_short
+                saved_S_risk := risk_per_unit
+
+        waiting_for_newh := false, tp_level_short := na
+
+// =========================================================================
+// 9. ORDER INVALIDATION & PARTIAL CLOSE (Rest of logic maintained)
+// =========================================================================
+if strategy.position_size == 0 and use_invalidation
+    if not na(pend_L_entry) and not na(pend_L_tp)
+        cancel_level = pend_L_entry + (pend_L_tp - pend_L_entry) * (invalidation_pct / 100.0)
+        if high >= cancel_level
+            strategy.cancel("Long"), pend_L_entry := na, pend_L_tp := na
+            
+    if not na(pend_S_entry) and not na(pend_S_tp)
+        cancel_level = pend_S_entry - (pend_S_entry - pend_S_tp) * (invalidation_pct / 100.0)
+        if low <= cancel_level
+            strategy.cancel("Short"), pend_S_entry := na, pend_S_tp := na
+
+if strategy.position_size > 0
+    pend_L_entry := na, pend_L_tp := na
+if strategy.position_size < 0
+    pend_S_entry := na, pend_S_tp := na
+
+var float long_entry_price  = na, var float active_L_risk     = na, var bool  long_partial_done  = false
+var float short_entry_price = na, var float active_S_risk     = na, var bool  short_partial_done = false
+
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    long_entry_price  := strategy.opentrades.entry_price(0), active_L_risk := saved_L_risk, long_partial_done := false
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    short_entry_price  := strategy.opentrades.entry_price(0), active_S_risk := saved_S_risk, short_partial_done := false
+
+if use_partial
+    if strategy.position_size > 0 and not long_partial_done
+        if not na(long_entry_price) and not na(active_L_risk)
+            partial_tgt  = long_entry_price + (active_L_risk * partial_mult)
+            if high >= partial_tgt
+                half_qty = math.max(1, math.floor(strategy.position_size * (partial_qty_pct / 100.0)))
+                strategy.close("Long", qty=half_qty, comment="Partial Close"), long_partial_done := true
+
+    if strategy.position_size < 0 and not short_partial_done
+        if not na(short_entry_price) and not na(active_S_risk)
+            partial_tgt  = short_entry_price - (active_S_risk * partial_mult)
+            if low <= partial_tgt
+                half_qty = math.max(1, math.floor(math.abs(strategy.position_size) * (partial_qty_pct / 100.0)))
+                strategy.close("Short", qty=half_qty, comment="Partial Close"), short_partial_done := true
